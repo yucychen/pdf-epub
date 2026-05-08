@@ -1,0 +1,65 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Generate icons
+        env:
+          FORCE_ICNS: '1'
+        run: python make_icon.py
+      - name: Build with PyInstaller
+        run: pyinstaller pdf2epub.spec --clean --noconfirm
+      - name: Package archive
+        shell: bash
+        run: |
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip pdf2epub-${{ runner.os }}.zip pdf2epub
+          else
+            tar -czf pdf2epub-${{ runner.os }}.tar.gz pdf2epub
+          fi
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdf2epub-${{ runner.os }}
+          path: |
+            dist/pdf2epub-${{ runner.os }}.zip
+            dist/pdf2epub-${{ runner.os }}.tar.gz
+          if-no-files-found: ignore
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - run: find artifacts -type f
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            artifacts/**/pdf2epub-*.zip
+            artifacts/**/pdf2epub-*.tar.gz
