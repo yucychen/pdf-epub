@@ -1,4 +1,21 @@
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""为 pdf-epub 项目增加 OCR 支持"""
+import os
+
+FILES = {}
+
+# ---------- requirements.txt ----------
+FILES["requirements.txt"] = """\
+PyMuPDF>=1.24.0
+EbookLib>=0.18
+beautifulsoup4>=4.12.0
+Pillow>=10.0.0
+pyinstaller>=6.6.0
+pytesseract>=0.3.10
+"""
+
+# ---------- pdf2epub.py ----------
+FILES["pdf2epub.py"] = r'''#!/usr/bin/env python3
 """PDF -> EPUB 转换工具(支持 OCR)
 用法:
     python pdf2epub.py input.pdf -o output.epub -t "书名" -a "作者"
@@ -229,6 +246,225 @@ def main():
     convert(args.pdf, output, title, args.author, args.lang,
             cover_path=args.cover, no_cover=args.no_cover,
             ocr_mode=args.ocr, ocr_lang=args.ocr_lang, ocr_dpi=args.ocr_dpi)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+# ---------- pdf2epub_gui.py ----------
+FILES["pdf2epub_gui.py"] = r'''"""GUI 包装,基于 tkinter(支持 OCR)"""
+import os
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+from pdf2epub import convert
+
+
+def run_convert(args, btn, status):
+    try:
+        status.set("转换中,请稍候...(OCR 较慢,请耐心)")
+        btn.config(state="disabled")
+        convert(**args)
+        status.set("完成")
+        messagebox.showinfo("完成", "已生成:\n" + args["epub_path"])
+    except Exception as e:
+        status.set("失败")
+        messagebox.showerror("错误", str(e))
+    finally:
+        btn.config(state="normal")
+
+
+def main():
+    root = tk.Tk()
+    root.title("PDF -> EPUB 转换器")
+    root.geometry("600x440")
+
+    pdf_var, out_var = tk.StringVar(), tk.StringVar()
+    title_var, author_var = tk.StringVar(), tk.StringVar(value="Unknown")
+    lang_var = tk.StringVar(value="zh")
+    cover_var = tk.StringVar()
+    ocr_var = tk.StringVar(value="off")
+    ocr_lang_var = tk.StringVar(value="chi_sim+eng")
+    status_var = tk.StringVar(value="选择 PDF 文件开始(扫描版请勾选 OCR)")
+
+    def pick_pdf():
+        p = filedialog.askopenfilename(filetypes=[("PDF", "*.pdf")])
+        if p:
+            pdf_var.set(p)
+            if not out_var.get():
+                out_var.set(p.rsplit(".", 1)[0] + ".epub")
+            if not title_var.get():
+                title_var.set(os.path.splitext(os.path.basename(p))[0])
+
+    def pick_out():
+        p = filedialog.asksaveasfilename(defaultextension=".epub",
+                                         filetypes=[("EPUB", "*.epub")])
+        if p:
+            out_var.set(p)
+
+    def pick_cover():
+        p = filedialog.askopenfilename(filetypes=[("Image", "*.png *.jpg *.jpeg")])
+        if p:
+            cover_var.set(p)
+
+    def start():
+        if not pdf_var.get() or not out_var.get():
+            messagebox.showwarning("提示", "请选择输入 PDF 和输出 EPUB 路径")
+            return
+        args = dict(
+            pdf_path=pdf_var.get(), epub_path=out_var.get(),
+            title=title_var.get() or "Untitled",
+            author=author_var.get() or "Unknown",
+            lang=lang_var.get() or "zh",
+            cover_path=cover_var.get() or None,
+            ocr_mode=ocr_var.get(),
+            ocr_lang=ocr_lang_var.get() or "chi_sim+eng",
+        )
+        threading.Thread(target=run_convert, daemon=True,
+                         args=(args, start_btn, status_var)).start()
+
+    frm = ttk.Frame(root, padding=12)
+    frm.pack(fill="both", expand=True)
+
+    def row(label, var, browse, r):
+        ttk.Label(frm, text=label).grid(row=r, column=0, sticky="w", pady=4)
+        ttk.Entry(frm, textvariable=var, width=50).grid(row=r, column=1, padx=4)
+        if browse:
+            ttk.Button(frm, text="...", width=3, command=browse).grid(row=r, column=2)
+
+    row("输入 PDF:", pdf_var, pick_pdf, 0)
+    row("输出 EPUB:", out_var, pick_out, 1)
+    row("书名:", title_var, None, 2)
+    row("作者:", author_var, None, 3)
+    row("语言:", lang_var, None, 4)
+    row("封面(可选):", cover_var, pick_cover, 5)
+
+    # OCR 选项
+    ttk.Label(frm, text="OCR 模式:").grid(row=6, column=0, sticky="w", pady=4)
+    ocr_frame = ttk.Frame(frm)
+    ocr_frame.grid(row=6, column=1, sticky="w")
+    ttk.Radiobutton(ocr_frame, text="关闭", variable=ocr_var, value="off").pack(side="left")
+    ttk.Radiobutton(ocr_frame, text="自动", variable=ocr_var, value="auto").pack(side="left")
+    ttk.Radiobutton(ocr_frame, text="强制", variable=ocr_var, value="force").pack(side="left")
+
+    ttk.Label(frm, text="OCR 语言:").grid(row=7, column=0, sticky="w", pady=4)
+    lang_combo = ttk.Combobox(frm, textvariable=ocr_lang_var, width=47,
+                              values=["chi_sim+eng", "chi_tra+eng", "eng",
+                                      "jpn+eng", "kor+eng"])
+    lang_combo.grid(row=7, column=1, padx=4, sticky="w")
+
+    start_btn = ttk.Button(frm, text="开始转换", command=start)
+    start_btn.grid(row=8, column=0, columnspan=3, pady=12)
+    ttk.Label(frm, textvariable=status_var, foreground="gray").grid(
+        row=9, column=0, columnspan=3)
+
+    ttk.Label(frm, text="提示:扫描版 PDF 选'强制'或'自动';需先安装 Tesseract",
+              foreground="#888").grid(row=10, column=0, columnspan=3, pady=4)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+# ---------- .github/workflows/build.yml(CI 自动装 Tesseract) ----------
+FILES[".github/workflows/build.yml"] = """\
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Tesseract (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-chi-tra tesseract-ocr-jpn tesseract-ocr-kor
+      - name: Install Tesseract (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tesseract tesseract-lang
+      - name: Install Tesseract (Windows)
+        if: runner.os == 'Windows'
+        run: choco install -y tesseract
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Generate icons
+        env:
+          FORCE_ICNS: '1'
+        run: python make_icon.py
+      - name: Build with PyInstaller
+        run: pyinstaller pdf2epub.spec --clean --noconfirm
+      - name: Package archive
+        shell: bash
+        run: |
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip pdf2epub-${{ runner.os }}.zip pdf2epub
+          else
+            tar -czf pdf2epub-${{ runner.os }}.tar.gz pdf2epub
+          fi
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdf2epub-${{ runner.os }}
+          path: |
+            dist/pdf2epub-${{ runner.os }}.zip
+            dist/pdf2epub-${{ runner.os }}.tar.gz
+          if-no-files-found: ignore
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - run: find artifacts -type f
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            artifacts/**/pdf2epub-*.zip
+            artifacts/**/pdf2epub-*.tar.gz
+"""
+
+
+def main():
+    for path, content in FILES.items():
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+        print("  ~", path)
+    print("\nOCR 支持已加入!下一步:")
+    print("  git add .")
+    print('  git commit -m "feat: add OCR support"')
+    print("  git push origin main")
+    print("  git tag v1.1.0 && git push origin v1.1.0")
 
 
 if __name__ == "__main__":
