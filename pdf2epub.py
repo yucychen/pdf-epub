@@ -72,10 +72,14 @@ def text_to_html(title, text, image_tags):
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     body = "\n".join("<p>{}</p>".format(escape(p)) for p in paragraphs)
     imgs = "\n".join(image_tags)
-    return ('<?xml version="1.0" encoding="utf-8"?>\n'
-            '<!DOCTYPE html>\n'
+    # 兜底:body 不能为空,否则 ebooklib 生成 nav 时 lxml 会报 "Document is empty"
+    if not body and not imgs:
+        body = "<p>&#160;</p>"
+    # 注意:不要加 <?xml ?> 声明,ebooklib 内部用 html parser 解析,
+    # 带 xml 声明 + 空 body 会触发 lxml.etree.ParserError
+    return ('<!DOCTYPE html>\n'
             '<html xmlns="http://www.w3.org/1999/xhtml">\n'
-            '<head><title>{t}</title>\n'
+            '<head><meta charset="utf-8"/><title>{t}</title>\n'
             '<link rel="stylesheet" type="text/css" href="style/main.css"/></head>\n'
             '<body>\n<h1>{t}</h1>\n{i}\n{b}\n</body></html>'
             ).format(t=escape(title), i=imgs, b=body)
@@ -125,10 +129,31 @@ def get_page_text(page, ocr_mode, ocr_lang, ocr_dpi):
         return clean_text(raw)
 
 
+def open_pdf(pdf_path):
+    """更友好的 PDF 打开:文件不存在 / 0 字节 / 加密都给清晰错误"""
+    if not os.path.isfile(pdf_path):
+        raise FileNotFoundError("PDF 不存在: {}".format(pdf_path))
+    if os.path.getsize(pdf_path) == 0:
+        raise ValueError("PDF 是空文件: {}".format(pdf_path))
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        raise RuntimeError(
+            "无法打开 PDF: {}\n原因: {}\n"
+            "可能是文件损坏或加密,请先用 PDF 工具检查".format(pdf_path, e)) from e
+    if doc.is_encrypted:
+        if not doc.authenticate(""):
+            raise RuntimeError(
+                "PDF 已加密: {}\n请先去除密码后再转换".format(pdf_path))
+    if doc.page_count == 0:
+        raise RuntimeError("PDF 没有任何页面: {}".format(pdf_path))
+    return doc
+
+
 def convert(pdf_path, epub_path, title, author, lang,
             cover_path=None, no_cover=False,
             ocr_mode="off", ocr_lang="chi_sim+eng", ocr_dpi=300):
-    doc = fitz.open(pdf_path)
+    doc = open_pdf(pdf_path)
     book = epub.EpubBook()
     book.set_identifier(str(uuid.uuid4()))
     book.set_title(title)
