@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""PDF -> EPUB 转换工具
-支持三种模式:
-  text  : 提取文字层(适合电子书原生 PDF),可选 OCR
-  image : 每页渲染成图直接嵌入(适合扫描书/漫画,无需 OCR,可读性最高)
-  auto  : 自动判断(默认)— 扫描页走 image,文字页走 text
-
-用法示例:
-  python pdf2epub.py book.pdf -o book.epub               # auto 模式
-  python pdf2epub.py scan.pdf --mode image               # 强制图片模式
-  python pdf2epub.py scan.pdf --mode text --ocr force    # 全本 OCR
-"""
+"""PDF -> EPUB 转换工具 (v1.1.3 - 多进程加速)"""
 import argparse
 import io
 import os
@@ -18,6 +8,7 @@ import shutil
 import sys
 import uuid
 from html import escape
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import fitz  # PyMuPDF
 from ebooklib import epub
@@ -50,15 +41,10 @@ def ocr_page(page, lang="chi_sim+eng", dpi=300):
         raise RuntimeError("pytesseract 未安装,请 pip install pytesseract")
     tess = _find_tesseract()
     if not tess:
-        raise RuntimeError(
-            "未找到 Tesseract。请安装:\n"
-            "  Windows: https://github.com/UB-Mannheim/tesseract/wiki\n"
-            "  macOS:   brew install tesseract tesseract-lang\n"
-            "  Linux:   sudo apt install tesseract-ocr tesseract-ocr-chi-sim")
+        raise RuntimeError("未找到 Tesseract,请先安装")
     pytesseract.pytesseract.tesseract_cmd = tess
     zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     img = Image.open(io.BytesIO(pix.tobytes("png")))
     return pytesseract.image_to_string(img, lang=lang)
 
@@ -76,7 +62,7 @@ def text_to_html(title, text, image_tags):
     body = "\n".join("<p>{}</p>".format(escape(p)) for p in paragraphs)
     imgs = "\n".join(image_tags)
     if not body and not imgs:
-        body = "<p>&#160;</p>"  # 兜底,避免 lxml "Document is empty"
+        body = "<p>&#160;</p>"
     return ('<!DOCTYPE html>\n'
             '<html xmlns="http://www.w3.org/1999/xhtml">\n'
             '<head><meta charset="utf-8"/><title>{t}</title>\n'
@@ -86,7 +72,6 @@ def text_to_html(title, text, image_tags):
 
 
 def extract_chapters(doc, max_pages_per_chapter=20):
-    """根据 PDF 大纲分章;无大纲时按固定页数分块"""
     toc = doc.get_toc()
     chapters = []
     if toc:
@@ -103,11 +88,9 @@ def extract_chapters(doc, max_pages_per_chapter=20):
     return chapters
 
 
-def render_cover(doc, dpi=150):
-    page = doc.load_page(0)
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
+def render_cover(doc, dpi=120):
+    pix = doc.load_page(0).get_pixmap(matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0),
+                                       alpha=False)
     return pix.tobytes("png")
 
 
@@ -128,12 +111,9 @@ def open_pdf(pdf_path):
 
 
 def detect_mode(doc, sample=10):
-    """auto 模式自动检测:扫描书 -> image,文字书 -> text"""
     n = min(sample, doc.page_count)
-    text_pages = 0
-    for i in range(n):
-        if len(doc.load_page(i).get_text("text").strip()) >= 50:
-            text_pages += 1
+    text_pages = sum(1 for i in range(n)
+                     if len(doc.load_page(i).get_text("text").strip()) >= 50)
     return "text" if text_pages >= n / 2 else "image"
 
 
@@ -150,34 +130,61 @@ def get_page_text(page, ocr_mode, ocr_lang, ocr_dpi):
         return clean_text(raw)
 
 
-def render_page_image(page, dpi=150, fmt="jpeg", quality=80):
-    """把一页渲染成图片字节流"""
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    if fmt == "png":
-        return pix.tobytes("png"), "png", "image/png"
-    # jpeg(默认,体积小)
-    img = Image.open(io.BytesIO(pix.tobytes("png"))) if _HAS_PYTESS else None
-    if img is None:
-        # 没装 Pillow 也能 fallback 成 png
-        return pix.tobytes("png"), "png", "image/png"
-    buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=True)
-    return buf.getvalue(), "jpg", "image/jpeg"
+# -------- 多进程渲染 worker(必须是顶级函数才能被 pickle) --------
+def _render_one(args):
+    """子进程:打开 PDF,渲染指定页,返回 (页号, jpeg字节)"""
+    pdf_path, page_no, dpi, quality = args
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc.load_page(page_no)
+        zoom = dpi / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        # ★ PyMuPDF 直出 JPEG,无需 Pillow,快 2-3 倍
+        try:
+            data = pix.tobytes("jpeg", jpg_quality=quality)
+        except (TypeError, ValueError):
+            # 老版本 PyMuPDF 不支持 jpeg,fallback 到 PNG
+            data = pix.tobytes("png")
+            return page_no, data, "png", "image/png"
+        return page_no, data, "jpg", "image/jpeg"
+    finally:
+        doc.close()
+
+
+def render_pages_parallel(pdf_path, page_indices, dpi, quality, workers, total):
+    """并行渲染一组页面,按页号顺序返回结果"""
+    tasks = [(pdf_path, p, dpi, quality) for p in page_indices]
+    results = {}
+    done = 0
+    if workers <= 1:
+        for t in tasks:
+            page_no, data, ext, media = _render_one(t)
+            results[page_no] = (data, ext, media)
+            done += 1
+            if done % 10 == 0 or done == len(tasks):
+                print("  rendered {}/{}".format(done, total), flush=True)
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for fut in as_completed(ex.submit(_render_one, t) for t in tasks):
+                page_no, data, ext, media = fut.result()
+                results[page_no] = (data, ext, media)
+                done += 1
+                if done % 10 == 0 or done == len(tasks):
+                    print("  rendered {}/{}".format(done, total), flush=True)
+    return [(p, *results[p]) for p in page_indices]
 
 
 def convert(pdf_path, epub_path, title, author, lang,
             cover_path=None, no_cover=False,
             mode="auto",
             ocr_mode="off", ocr_lang="chi_sim+eng", ocr_dpi=300,
-            image_dpi=150, image_quality=80):
+            image_dpi=120, image_quality=80, workers=None):
     doc = open_pdf(pdf_path)
-
-    # 决定最终模式
     actual_mode = mode if mode != "auto" else detect_mode(doc)
-    print("Mode: {} (requested: {}), pages: {}".format(
-        actual_mode, mode, doc.page_count))
+    if workers is None:
+        workers = max(1, (os.cpu_count() or 2) - 1)
+    print("Mode: {} (requested: {}), pages: {}, workers: {}".format(
+        actual_mode, mode, doc.page_count, workers if actual_mode == "image" else 1))
 
     book = epub.EpubBook()
     book.set_identifier(str(uuid.uuid4()))
@@ -185,7 +192,6 @@ def convert(pdf_path, epub_path, title, author, lang,
     book.set_language(lang)
     book.add_author(author)
 
-    # 封面
     if not no_cover:
         try:
             if cover_path and os.path.isfile(cover_path):
@@ -199,39 +205,35 @@ def convert(pdf_path, epub_path, title, author, lang,
         except Exception as e:
             print("WARN: cover generation failed, skipped:", e)
 
-    # CSS
     css = epub.EpubItem(
-        uid="style_main", file_name="style/main.css",
-        media_type="text/css",
+        uid="style_main", file_name="style/main.css", media_type="text/css",
         content=("body{margin:0;padding:0;font-family:serif;line-height:1.6;}"
                  "h1{font-size:1.4em;margin:1em;}"
                  "p{margin:0.6em 1em;text-indent:2em;}"
                  ".page{text-align:center;margin:0;padding:0;}"
-                 "img{max-width:100%;height:auto;display:block;margin:0 auto;}")
-    )
+                 "img{max-width:100%;height:auto;display:block;margin:0 auto;}"))
     book.add_item(css)
 
     chapters = extract_chapters(doc)
     epub_chapters = []
     image_counter = 0
     total = doc.page_count
-    done = 0
 
+    # ★ image 模式:先并行渲染所有页,再组装章节(最大化并行度)
+    rendered = {}
+    if actual_mode == "image":
+        all_pages = list(range(total))
+        for page_no, data, ext, media in render_pages_parallel(
+                pdf_path, all_pages, image_dpi, image_quality, workers, total):
+            rendered[page_no] = (data, ext, media)
+
+    done_text = 0
     for idx, (ch_title, start, end) in enumerate(chapters, 1):
         text_parts, image_tags = [], []
 
         for pno in range(start, end):
-            page = doc.load_page(pno)
-            done += 1
-
             if actual_mode == "image":
-                # ★ 图片模式:每页渲染一张图,直接放进章节
-                try:
-                    data, ext, media = render_page_image(
-                        page, dpi=image_dpi, quality=image_quality)
-                except Exception as e:
-                    print("WARN: render page {} failed: {}".format(pno + 1, e))
-                    continue
+                data, ext, media = rendered[pno]
                 image_counter += 1
                 img_name = "images/page_{:04d}.{}".format(pno + 1, ext)
                 book.add_item(epub.EpubItem(
@@ -240,13 +242,12 @@ def convert(pdf_path, epub_path, title, author, lang,
                 image_tags.append(
                     '<div class="page"><img src="{}" alt="page {}"/></div>'.format(
                         img_name, pno + 1))
-                if done % 10 == 0 or done == total:
-                    print("  page {}/{}".format(done, total), flush=True)
             else:
-                # text 模式:提取文字(可选 OCR)+ 嵌入页面里的图片
+                page = doc.load_page(pno)
                 text_parts.append(get_page_text(page, ocr_mode, ocr_lang, ocr_dpi))
-                if ocr_mode != "off":
-                    print("  page {}/{}".format(done, total), flush=True)
+                done_text += 1
+                if ocr_mode != "off" and (done_text % 5 == 0 or done_text == total):
+                    print("  ocr {}/{}".format(done_text, total), flush=True)
                 for img in page.get_images(full=True):
                     xref = img[0]
                     try:
@@ -275,6 +276,7 @@ def convert(pdf_path, epub_path, title, author, lang,
     book.add_item(epub.EpubNav())
     book.spine = ["nav"] + epub_chapters
 
+    print("Writing EPUB ...", flush=True)
     epub.write_epub(epub_path, book)
     print("Done:", epub_path,
           "({} chapters, {} images, mode={})".format(
@@ -282,33 +284,32 @@ def convert(pdf_path, epub_path, title, author, lang,
 
 
 def main():
-    p = argparse.ArgumentParser(
-        description="Convert PDF to EPUB (text / image / auto)")
+    p = argparse.ArgumentParser(description="Convert PDF to EPUB")
     p.add_argument("pdf")
     p.add_argument("-o", "--output")
     p.add_argument("-t", "--title")
     p.add_argument("-a", "--author", default="Unknown")
     p.add_argument("-l", "--lang", default="zh")
-    p.add_argument("-c", "--cover", help="Custom cover image (png/jpg)")
+    p.add_argument("-c", "--cover")
     p.add_argument("--no-cover", action="store_true")
-    p.add_argument("--mode", choices=["auto", "text", "image"], default="auto",
-                   help="转换模式:auto(默认)/ text(文字层) / image(每页渲染成图,适合扫描书)")
-    p.add_argument("--image-dpi", type=int, default=150,
-                   help="image 模式渲染 DPI,默认 150。提高更清晰但文件更大")
+    p.add_argument("--mode", choices=["auto", "text", "image"], default="auto")
+    p.add_argument("--image-dpi", type=int, default=120,
+                   help="image 模式 DPI(默认 120,提高更清晰但更慢/更大)")
     p.add_argument("--image-quality", type=int, default=80,
-                   help="image 模式 JPEG 质量 (1-95),默认 80")
-    p.add_argument("--ocr", choices=["off", "auto", "force"], default="off",
-                   help="text 模式下的 OCR:off/auto/force")
+                   help="JPEG 质量 1-95,默认 80")
+    p.add_argument("--workers", type=int, default=None,
+                   help="并行进程数,默认 CPU核心数-1。设 1 关闭并行")
+    p.add_argument("--ocr", choices=["off", "auto", "force"], default="off")
     p.add_argument("--ocr-lang", default="chi_sim+eng")
     p.add_argument("--ocr-dpi", type=int, default=300)
     args = p.parse_args()
     title = args.title or os.path.splitext(os.path.basename(args.pdf))[0]
     output = args.output or "{}.epub".format(title)
     convert(args.pdf, output, title, args.author, args.lang,
-            cover_path=args.cover, no_cover=args.no_cover,
-            mode=args.mode,
+            cover_path=args.cover, no_cover=args.no_cover, mode=args.mode,
             ocr_mode=args.ocr, ocr_lang=args.ocr_lang, ocr_dpi=args.ocr_dpi,
-            image_dpi=args.image_dpi, image_quality=args.image_quality)
+            image_dpi=args.image_dpi, image_quality=args.image_quality,
+            workers=args.workers)
 
 
 if __name__ == "__main__":
