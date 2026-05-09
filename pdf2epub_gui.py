@@ -1,4 +1,5 @@
 """GUI 包装,基于 tkinter(支持 image / text / auto 三模式)"""
+import multiprocessing
 import os
 import threading
 import tkinter as tk
@@ -88,7 +89,6 @@ def main():
     row("语言:", lang_var, None, 4)
     row("封面(可选):", cover_var, pick_cover, 5)
 
-    # 模式选择
     ttk.Label(frm, text="转换模式:").grid(row=6, column=0, sticky="w", pady=4)
     mode_frame = ttk.Frame(frm)
     mode_frame.grid(row=6, column=1, sticky="w")
@@ -96,7 +96,6 @@ def main():
     ttk.Radiobutton(mode_frame, text="文字(电子书)", variable=mode_var, value="text").pack(side="left")
     ttk.Radiobutton(mode_frame, text="图片(扫描书)", variable=mode_var, value="image").pack(side="left")
 
-    # OCR(仅 text 模式有用)
     ttk.Label(frm, text="OCR(仅文字模式):").grid(row=7, column=0, sticky="w", pady=4)
     ocr_frame = ttk.Frame(frm)
     ocr_frame.grid(row=7, column=1, sticky="w")
@@ -123,4 +122,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # ★ 关键:Windows 下 PyInstaller 打包后多进程会重启程序,
+    # 必须先调用 freeze_support(),否则每个 worker 都会弹一个 GUI 窗口
+    multiprocessing.freeze_support()
     main()

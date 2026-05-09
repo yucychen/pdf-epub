@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""PDF -> EPUB 转换工具 (v1.1.3 - 多进程加速)"""
+"""PDF -> EPUB 转换工具 (v1.1.4 - 多进程加速 + Windows freeze_support)"""
 import argparse
 import io
+import multiprocessing
 import os
 import re
 import shutil
@@ -49,7 +50,6 @@ def ocr_page(page, lang="chi_sim+eng", dpi=300):
     return pytesseract.image_to_string(img, lang=lang)
 
 
-# ---------------- 文本处理 ----------------
 def clean_text(text):
     text = re.sub(r"-\n(\w)", r"\1", text)
     text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
@@ -130,29 +130,24 @@ def get_page_text(page, ocr_mode, ocr_lang, ocr_dpi):
         return clean_text(raw)
 
 
-# -------- 多进程渲染 worker(必须是顶级函数才能被 pickle) --------
+# -------- 多进程渲染 worker --------
 def _render_one(args):
-    """子进程:打开 PDF,渲染指定页,返回 (页号, jpeg字节)"""
     pdf_path, page_no, dpi, quality = args
     doc = fitz.open(pdf_path)
     try:
         page = doc.load_page(page_no)
         zoom = dpi / 72.0
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-        # ★ PyMuPDF 直出 JPEG,无需 Pillow,快 2-3 倍
         try:
             data = pix.tobytes("jpeg", jpg_quality=quality)
+            return page_no, data, "jpg", "image/jpeg"
         except (TypeError, ValueError):
-            # 老版本 PyMuPDF 不支持 jpeg,fallback 到 PNG
-            data = pix.tobytes("png")
-            return page_no, data, "png", "image/png"
-        return page_no, data, "jpg", "image/jpeg"
+            return page_no, pix.tobytes("png"), "png", "image/png"
     finally:
         doc.close()
 
 
 def render_pages_parallel(pdf_path, page_indices, dpi, quality, workers, total):
-    """并行渲染一组页面,按页号顺序返回结果"""
     tasks = [(pdf_path, p, dpi, quality) for p in page_indices]
     results = {}
     done = 0
@@ -219,7 +214,6 @@ def convert(pdf_path, epub_path, title, author, lang,
     image_counter = 0
     total = doc.page_count
 
-    # ★ image 模式:先并行渲染所有页,再组装章节(最大化并行度)
     rendered = {}
     if actual_mode == "image":
         all_pages = list(range(total))
@@ -293,12 +287,9 @@ def main():
     p.add_argument("-c", "--cover")
     p.add_argument("--no-cover", action="store_true")
     p.add_argument("--mode", choices=["auto", "text", "image"], default="auto")
-    p.add_argument("--image-dpi", type=int, default=120,
-                   help="image 模式 DPI(默认 120,提高更清晰但更慢/更大)")
-    p.add_argument("--image-quality", type=int, default=80,
-                   help="JPEG 质量 1-95,默认 80")
-    p.add_argument("--workers", type=int, default=None,
-                   help="并行进程数,默认 CPU核心数-1。设 1 关闭并行")
+    p.add_argument("--image-dpi", type=int, default=120)
+    p.add_argument("--image-quality", type=int, default=80)
+    p.add_argument("--workers", type=int, default=None)
     p.add_argument("--ocr", choices=["off", "auto", "force"], default="off")
     p.add_argument("--ocr-lang", default="chi_sim+eng")
     p.add_argument("--ocr-dpi", type=int, default=300)
@@ -313,4 +304,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # ★ Windows + PyInstaller 必备:防止子进程重启时再跑一遍 main
+    multiprocessing.freeze_support()
     main()
